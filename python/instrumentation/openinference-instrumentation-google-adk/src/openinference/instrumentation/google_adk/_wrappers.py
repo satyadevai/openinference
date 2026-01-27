@@ -106,7 +106,8 @@ class _RunnerRunAsync(_WithTracer):
             attributes[SpanAttributes.USER_ID] = user_id
         if (session_id := kwargs.get("session_id")) is not None:
             attributes[SpanAttributes.SESSION_ID] = session_id
-
+        app_name = instance.app_name
+        session_service = instance.session_service
         class _AsyncGenerator(wrapt.ObjectProxy):  # type: ignore[misc]
             __wrapped__: AsyncGenerator[Event, None]
 
@@ -133,6 +134,15 @@ class _RunnerRunAsync(_WithTracer):
                                     SpanAttributes.OUTPUT_MIME_TYPE,
                                     OpenInferenceMimeTypeValues.JSON.value,
                                 )
+                                if session_service:
+                                    updated_session = await session_service.get_session(
+                                        app_name=app_name, user_id=user_id, session_id=session_id
+                                    )
+                                    if session_state:=updated_session.state:
+                                        span.set_attribute(
+                                            SpanAttributes.METADATA, safe_json_dumps(updated_session.state)
+                                        )
+                                print(f"Updated session state in wrappers: {updated_session.state}")
                             except Exception:
                                 logger.exception(
                                     f"Failed to get attribute: {SpanAttributes.OUTPUT_VALUE}."
