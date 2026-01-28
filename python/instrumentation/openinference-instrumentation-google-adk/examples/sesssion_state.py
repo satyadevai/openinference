@@ -1,4 +1,6 @@
+import time
 from google.adk.agents import LlmAgent
+from google.adk.events import EventActions, Event
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai.types import Content, Part
@@ -50,6 +52,27 @@ async def run():
         app_name=app_name, user_id=user_id, session_id=session_id
     )
     print(f"State after agent run: {updated_session.state}")
+
+    current_time = time.time()
+    state_changes = {
+        "task_status": "active",  # Update session state
+        "user:login_count": session.state.get("user:login_count", 0) + 1,  # Update user state
+        "user:last_login_ts": current_time,  # Add user state
+        "temp:validation_needed": True  # Add temporary state (will be discarded)
+    }
+    actions_with_update = EventActions(state_delta=state_changes)
+    system_event = Event(
+        invocation_id="inv_login_update",
+        author="system",  # Or 'agent', 'tool' etc.
+        actions=actions_with_update,
+        timestamp=current_time
+        # content might be None or represent the action taken
+    )
+
+    # --- Append the Event (This updates the state) ---
+    await session_service.append_event(session, system_event)
+    print("`append_event` called with explicit state delta.")
+
 
 
 if __name__ == "__main__":
