@@ -12,14 +12,15 @@ class GetWeatherTool(Tool):
         return "sunny"
 
 
-model = OpenAIServerModel(model_id="gpt-4o")
-output = model(
-    messages=[
-        {
-            "role": "user",
-            "content": "What is the weather in Paris?",
-        }
-    ],
-    tools_to_call_from=[GetWeatherTool()],
-)
-print(output.tool_calls[0].function)
+if __name__ == "__main__":
+    model = OpenAIServerModel(model_id="gpt-4o")
+    output = model(
+        messages=[
+            {
+                "role": "user",
+                "content": "What is the weather in Paris & New Delhi?",
+            }
+        ],
+        tools_to_call_from=[GetWeatherTool()],
+    )
+    print(output.tool_calls[0].function)
