@@ -19,19 +19,28 @@ import io.opentelemetry.sdk.resources.Resource;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.export.BatchSpanProcessor;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import java.awt.Color;
+import java.awt.Graphics2D;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import javax.imageio.ImageIO;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.content.Media;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.openai.api.OpenAiApi;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.function.FunctionToolCallback;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.util.MimeTypeUtils;
 
 /**
  * Example demonstrating OpenInference instrumentation with Spring AI.
@@ -130,6 +139,9 @@ public class SpringAI {
                 .build());
         logger.info("Response: " + response2.getResult().getOutput().toString());
 
+        // Third request: a multi-modal prompt, captured as llm.input_messages.*.message.contents.*
+        sendMultiModalRequest(chatModel);
+
         if (tracerProvider != null) {
             logger.info("Flushing and shutting down trace provider...");
 
@@ -153,6 +165,59 @@ public class SpringAI {
         }
 
         System.out.println("\\nTraces have been sent to Phoenix at http://localhost:6006");
+    }
+
+    /**
+     * Sends a prompt that carries an image alongside the text.
+     *
+     * <p>Spring AI keeps media separate from the message text, so the instrumentor emits the
+     * OpenInference multi-part layout for this message:
+     *
+     * <pre>
+     * llm.input_messages.0.message.contents.0.message_content.type            = text
+     * llm.input_messages.0.message.contents.0.message_content.text            = What color is this image? ...
+     * llm.input_messages.0.message.contents.1.message_content.type            = image
+     * llm.input_messages.0.message.contents.1.message_content.image.image.url = data:image/jpeg;base64,...
+     * </pre>
+     *
+     * <p>The flat {@code message.content} attribute is omitted for this message; text-only
+     * messages (the two requests above) still use it.
+     */
+    private static void sendMultiModalRequest(OpenAiChatModel chatModel) {
+        logger.info("\\nSending a multi-modal request (text + image)...");
+
+        byte[] imageBytes = redSquareJpeg();
+        UserMessage message = UserMessage.builder()
+                .text("What color is this image? Answer with a single word.")
+                .media(List.of(new Media(MimeTypeUtils.IMAGE_JPEG, new ByteArrayResource(imageBytes))))
+                .build();
+
+        // The default options above pin gpt-4 plus tool callbacks; override per-request with a
+        // vision-capable model and no tools.
+        ChatResponse response = chatModel.call(new Prompt(
+                List.of(message),
+                OpenAiChatOptions.builder().model("gpt-4o-mini").maxTokens(64).build()));
+
+        logger.info("Response: " + response.getResult().getOutput().getText());
+    }
+
+    /** Builds a genuine 16x16 red JPEG so the model has real image bytes to describe. */
+    private static byte[] redSquareJpeg() {
+        // ImageIO needs a headless-safe graphics environment.
+        System.setProperty("java.awt.headless", "true");
+        try {
+            BufferedImage image = new BufferedImage(16, 16, BufferedImage.TYPE_INT_RGB);
+            Graphics2D graphics = image.createGraphics();
+            graphics.setColor(Color.RED);
+            graphics.fillRect(0, 0, 16, 16);
+            graphics.dispose();
+
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            ImageIO.write(image, "jpg", out);
+            return out.toByteArray();
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not encode the sample image", e);
+        }
     }
 
     private static void initializeOpenTelemetry() {
