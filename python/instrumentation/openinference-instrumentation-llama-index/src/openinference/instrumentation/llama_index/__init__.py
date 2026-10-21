@@ -22,6 +22,7 @@ class LlamaIndexInstrumentor(BaseInstrumentor):  # type: ignore
         "_config",
         "_span_handler",
         "_event_handler",
+        "_stream_patcher",
         "_use_legacy_callback_handler",  # deprecated
         "_original_global_handler",  # deprecated
     )
@@ -71,6 +72,7 @@ class LlamaIndexInstrumentor(BaseInstrumentor):  # type: ignore
             )
 
             from ._handler import EventHandler, _SpanHandler
+            from ._llm_stream import _StreamMethodPatcher
 
             self._span_handler = _SpanHandler(
                 tracer=tracer,  # type: ignore[arg-type]
@@ -90,6 +92,8 @@ class LlamaIndexInstrumentor(BaseInstrumentor):  # type: ignore
                     break
             else:
                 dispatcher.add_event_handler(self._event_handler)
+            self._stream_patcher = _StreamMethodPatcher()
+            self._stream_patcher.patch()
 
     def _uninstrument(self, **kwargs: Any) -> None:
         if self._use_legacy_callback_handler:
@@ -114,6 +118,7 @@ class LlamaIndexInstrumentor(BaseInstrumentor):  # type: ignore
                 dispatcher.event_handlers,
             )
             self._event_handler = None
+            self._stream_patcher.unpatch()
 
 
 def get_current_span() -> Optional[Span]:

@@ -1,11 +1,13 @@
+import asyncio
 import copy
 import dataclasses
 import inspect
 import json
 import logging
+import re
 import weakref
 from collections import defaultdict
-from contextvars import Context, Token, copy_context
+from contextvars import Context, ContextVar, Token, copy_context
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import singledispatch, singledispatchmethod
@@ -31,7 +33,7 @@ from typing import (
     Tuple,
     TypeVar,
     Union,
-    cast,
+    get_origin,
 )
 
 from opentelemetry import context as context_api
@@ -58,6 +60,7 @@ from wrapt import ObjectProxy
 from llama_index.core import QueryBundle
 from llama_index.core.response_synthesizers.base import BaseSynthesizer
 from openinference.instrumentation.llama_index._finish_reason import _extract_finish_reason
+from openinference.instrumentation.llama_index._llm_stream import _LLM_STREAMS
 from openinference.instrumentation.llama_index._stream import _ResponseStream
 
 # Conditionally import agent base classes (they may not exist in all versions)
@@ -320,23 +323,6 @@ class _StreamingStatus(Enum):
     IN_PROGRESS = auto()
 
 
-class _CurrentSpan(ObjectProxy):  # type: ignore[misc,type-arg,unused-ignore]
-    """Stands in for a LlamaIndex span in the runtime context.
-
-    A call that returns a Future exits from the event loop, outside the Context the span
-    was attached in, so the caller's Context cannot be reset. Once released, the stand-in
-    resolves to the span that was current before, and that Context stops parenting new
-    spans under the finished one.
-    """
-
-    def __init__(self, span: Span) -> None:
-        super().__init__(span)
-        self._self_previous = get_current_span()
-
-    def release(self) -> None:
-        self.__wrapped__ = self._self_previous
-
-
 class _Span(BaseSpan):
     _otel_span: Span = PrivateAttr()
     _attributes: Dict[str, AttributeValue] = PrivateAttr()
@@ -347,8 +333,10 @@ class _Span(BaseSpan):
 
     _end_time: Optional[int] = PrivateAttr()
     _last_updated_at: float = PrivateAttr()
-    _current_span: _CurrentSpan = PrivateAttr()
-    _context_token: Optional[Token[context_api.Context]] = PrivateAttr()
+    _current_span: Optional["_CurrentSpan"] = PrivateAttr()
+    _attached_context: Optional[context_api.Context] = PrivateAttr()
+    _context_tokens: Optional[Tuple["Token[Optional[_Span]]", object]] = PrivateAttr()
+    _exited: bool = PrivateAttr()
 
     def __init__(
         self,
@@ -366,8 +354,10 @@ class _Span(BaseSpan):
         self._attributes = {}
         self._end_time = None
         self._last_updated_at = time()
-        self._current_span = _CurrentSpan(otel_span)
-        self._context_token = None
+        self._current_span = None
+        self._attached_context = None
+        self._context_tokens = None
+        self._exited = False
         self._list_attr_len: DefaultDict[str, int] = defaultdict(int)
 
     def __setitem__(self, key: str, value: AttributeValue) -> None:
@@ -377,22 +367,50 @@ class _Span(BaseSpan):
         self._otel_span.record_exception(exception)
 
     def attach_context(self) -> None:
-        self._context_token = context_api.attach(
-            set_span_in_context(cast(Span, self._current_span))
-        )
+        """Make this span current so spans from other instrumentors nest under it."""
+        previous = get_current_span()
+        while isinstance(previous, _CurrentSpan) and previous.restored:
+            previous = previous.__wrapped__
+        current = _CurrentSpan(self._otel_span, previous)
+        context = set_span_in_context(current)  # type: ignore[arg-type]
+        self._current_span = current
+        self._attached_context = context
+        self._context_tokens = (_ATTACHED_SPAN.set(self), context_api.attach(context))
 
     def detach_context(self) -> None:
-        if (token := self._context_token) is None:
-            return
-        self._context_token = None
-        self._current_span.release()
+        """Restore the context that was current before this span was attached."""
+        self._exited = True
+        self._restore_context()
+
+    def _restore_context(self) -> bool:
+        if (tokens := self._context_tokens) is None:
+            return False
+        marker, token = tokens
         try:
-            # context_api.detach would log the expected cross-Context failure as an error.
-            token.var.reset(token)
+            _ATTACHED_SPAN.reset(marker)
         except ValueError:
-            pass
+            # A sync call that returns an asyncio.Future exits from the future's
+            # done callback, which runs in another context. The caller's context
+            # is cleaned up the next time a span starts there.
+            return False
+        self._context_tokens = None
+        context_api.detach(token)  # type: ignore[arg-type]
+        return True
+
+    def restore_context_after_exit(self) -> bool:
+        """Remove this span from the current context if it exited elsewhere.
+
+        Only done while this span is still the latest one attached, so contexts
+        attached after it are left alone.
+        """
+        if not self._exited or context_api.get_current() is not self._attached_context:
+            return False
+        return self._restore_context()
 
     def end(self, exception: Optional[BaseException] = None) -> None:
+        if (current := self._current_span) is not None:
+            self._current_span = None
+            current.release()
         if not self._active:
             return
         self._active = False
@@ -964,6 +982,56 @@ def _get_attributes_from_image_block(
 END_OF_QUEUE = None
 
 
+# Marks the span attached in the current context, so a span can tell whether it is
+# exiting in the same context it was attached in.
+_ATTACHED_SPAN: "ContextVar[Optional[_Span]]" = ContextVar(
+    "openinference_llama_index_attached_span", default=None
+)
+
+
+class _CurrentSpan(ObjectProxy):  # type: ignore[misc,name-defined,type-arg,unused-ignore]
+    """
+    The span made current while a LlamaIndex call runs.
+
+    When the caller's context can't be restored, it keeps this span after the
+    call ends. Once the call's span ends, it stands in for the span that was
+    current before it, so later spans and span updates go there instead of to
+    a finished span.
+    """
+
+    def __init__(self, span: Span, previous: Span) -> None:
+        super().__init__(span)  # type: ignore[no-untyped-call]
+        self._self_previous = previous
+        self._self_restored = False
+
+    @property
+    def restored(self) -> bool:
+        return self._self_restored
+
+    def release(self) -> None:
+        self.__wrapped__ = self._self_previous
+        self._self_restored = True
+
+
+def _restore_contexts_after_exit() -> None:
+    """Remove spans left in the current context by calls that exited elsewhere."""
+    while (span := _ATTACHED_SPAN.get()) is not None and span.restore_context_after_exit():
+        pass
+
+
+def _returns_future(signature: inspect.Signature) -> bool:
+    """Whether the decorated function says it returns an asyncio.Future.
+
+    The dispatcher exits such calls from the future's done callback, in another
+    context, so their span can't be removed from the caller's context.
+    """
+    annotation = signature.return_annotation
+    if isinstance(annotation, str):
+        return re.search(r"\bFuture\b", annotation) is not None
+    annotation = get_origin(annotation) or annotation
+    return isinstance(annotation, type) and issubclass(annotation, asyncio.Future)
+
+
 @dataclass
 class _QueueItem:
     last_touched_at: float
@@ -1055,6 +1123,7 @@ class _SpanHandler(BaseSpanHandler[_Span], extra="allow"):
     ) -> Optional[_Span]:
         if context_api.get_value(_SUPPRESS_INSTRUMENTATION_KEY):
             return None
+        _restore_contexts_after_exit()
         with self.lock:
             parent = self.open_spans.get(parent_span_id) if parent_span_id else None
         if parent is None and parent_span_id:
@@ -1076,9 +1145,12 @@ class _SpanHandler(BaseSpanHandler[_Span], extra="allow"):
             id_=id_,
             parent_id=parent_span_id,
         )
-        span.attach_context()
         span.process_instance(instance)
         span.process_input(instance, bound_args)
+        # Attach last: if processing raises, the span never reaches open_spans and
+        # nothing would detach it.
+        if not _returns_future(bound_args.signature):
+            span.attach_context()
         return span
 
     def prepare_to_exit_span(
@@ -1125,6 +1197,8 @@ class _SpanHandler(BaseSpanHandler[_Span], extra="allow"):
                 and result.ag_frame is not None
             ):
                 span._end_time = time_ns()
+                if (streams := _LLM_STREAMS.get()) is not None:
+                    streams.append((result, span))
                 self._export_queue.put(span)
                 return span
             span.process_output(instance, result)
